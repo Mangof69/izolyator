@@ -1,94 +1,141 @@
 package ru.izolyator
 
 import android.app.Activity
+import android.content.Intent
+import android.net.VpnService
 import android.os.Bundle
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
-    private var protectionOn = false
     private lateinit var status: TextView
-    private lateinit var toggle: Button
-    private lateinit var details: TextView
+    private lateinit var list: LinearLayout
+    private val selected = linkedSetOf<String>()
+    private val prefs by lazy { getSharedPreferences("isolation", MODE_PRIVATE) }
+    private val apps = mutableListOf<ApplicationInfo>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        selected.addAll(prefs.getStringSet("selected_packages", emptySet()) ?: emptySet())
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24, 28, 24, 24)
+            setPadding(20, 24, 20, 16)
             setBackgroundColor(Color.rgb(247, 248, 250))
         }
         root.addView(TextView(this).apply {
             text = "ИЗОЛЯТОР"
-            textSize = 28f
-            setTextColor(Color.rgb(25, 45, 70))
+            textSize = 27f
             gravity = Gravity.CENTER
+            setTextColor(Color.rgb(25, 45, 70))
         }, match(WRAP))
         root.addView(TextView(this).apply {
-            text = "Контроль приложений"
-            textSize = 16f
+            text = "Блокировка сети выбранных приложений"
+            textSize = 15f
             gravity = Gravity.CENTER
-            setPadding(0, 8, 0, 24)
+            setPadding(0, 8, 0, 12)
         }, match(WRAP))
         status = TextView(this).apply {
-            textSize = 18f
+            textSize = 16f
             gravity = Gravity.CENTER
-            setPadding(12, 18, 12, 18)
+            setPadding(8, 12, 8, 12)
         }
         root.addView(status, match(WRAP))
-        toggle = Button(this).apply {
-            textSize = 16f
-            setOnClickListener {
-                protectionOn = !protectionOn
-                renderStatus()
-            }
-        }
-        root.addView(toggle, match(WRAP))
         root.addView(Button(this).apply {
-            text = "Выбрать приложение для проверки"
-            setOnClickListener { showInstalledApps() }
+            text = "Сохранить выбор и включить блокировку"
+            setOnClickListener { startBlocking() }
         }, match(WRAP))
-        details = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.DKGRAY)
-            setPadding(4, 20, 4, 8)
-            text = "Переключатель пока не блокирует приложения системно."
-        }
+        root.addView(Button(this).apply {
+            text = "Остановить блокировку"
+            setOnClickListener { stopService(Intent(this@MainActivity, AppBlockVpnService::class.java)); refreshStatus() }
+        }, match(WRAP))
+        root.addView(TextView(this).apply {
+            text = "Отметь приложения ниже. Их сетевые пакеты будут отбрасываться, пока работает VPN. Это блокирует сеть, но не отключает само приложение."
+            textSize = 13f
+            setPadding(2, 10, 2, 10)
+        }, match(WRAP))
         val scroll = ScrollView(this)
-        scroll.addView(details)
+        list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        scroll.addView(list)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(root)
-        renderStatus()
+        loadApps()
+        refreshStatus()
     }
 
-    private fun renderStatus() {
-        status.text = if (protectionOn) "Режим включён (демо)" else "Режим выключен"
-        status.setTextColor(if (protectionOn) Color.rgb(0, 120, 70) else Color.rgb(90, 90, 90))
-        toggle.text = if (protectionOn) "Выключить режим" else "Включить режим"
-        details.text = if (protectionOn)
-            "Демо-режим активен. Реальная сетевая блокировка требует VPN-сервиса и системного разрешения пользователя. Android не позволяет обычному приложению полностью изолировать другие приложения."
-        else
-            "Пока режим выключен. Можно просмотреть установленные приложения. Это начальная версия, не полноценная песочница."
+    override fun onResume() {
+        super.onResume()
+        refreshStatus()
     }
 
-    private fun showInstalledApps() {
+    private fun loadApps() {
         val pm = packageManager
-        val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-            .filter { it.packageName != packageName }
-            .sortedBy { pm.getApplicationLabel(it).toString().lowercase() }
-        val lines = apps.take(250).map {
-            "${pm.getApplicationLabel(it)}\n${it.packageName}"
+        apps.clear()
+        apps.addAll(pm.getInstalledApplications(PackageManager.GET_META_DATA)
+            .filter { it.packageName != packageName && (it.flags and ApplicationInfo.FLAG_SYSTEM == 0) }
+            .sortedBy { pm.getApplicationLabel(it).toString().lowercase() })
+        list.removeAllViews()
+        for (app in apps) {
+            val cb = CheckBox(this).apply {
+                text = "${pm.getApplicationLabel(app)}\n${app.packageName}"
+                textSize = 14f
+                isChecked = selected.contains(app.packageName)
+                setPadding(4, 8, 4, 8)
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked) selected.add(app.packageName) else selected.remove(app.packageName)
+                    prefs.edit().putStringSet("selected_packages", selected.toSet()).apply()
+                }
+            }
+            list.addView(cb, match(WRAP))
         }
-        details.text = if (lines.isEmpty()) "Список приложений недоступен." else
-            "Установленные приложения (до 250):\n\n" + lines.joinToString("\n\n")
+        if (apps.isEmpty()) list.addView(TextView(this).apply { text = "Приложения не найдены." })
+    }
+
+    private fun startBlocking() {
+        if (selected.isEmpty()) {
+            Toast.makeText(this, "Сначала выбери хотя бы одно приложение", Toast.LENGTH_LONG).show()
+            return
+        }
+        prefs.edit().putStringSet("selected_packages", selected.toSet()).apply()
+        val consent = VpnService.prepare(this)
+        if (consent != null) {
+            @Suppress("DEPRECATION")
+            startActivityForResult(consent, VPN_REQUEST)
+        } else startVpnService()
+    }
+
+    @Deprecated("Deprecated by Android API; retained for VPN consent compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == VPN_REQUEST && resultCode == RESULT_OK) startVpnService()
+        else refreshStatus()
+    }
+
+    private fun startVpnService() {
+        val intent = Intent(this, AppBlockVpnService::class.java).setAction(AppBlockVpnService.ACTION_START)
+        try {
+            startForegroundService(intent)
+            status.text = "Запрос запуска отправлен; проверяем состояние службы…"
+        } catch (e: Exception) {
+            status.text = "Защита не запущена: ${e.javaClass.simpleName}: ${e.message}"
+        }
+        status.setTextColor(Color.rgb(160, 80, 0))
+    }
+
+    private fun refreshStatus() {
+        val running = AppBlockVpnService.isRunning
+        status.text = if (running) "БЛОКИРОВКА СЕТИ РАБОТАЕТ" else "ЗАЩИТА НЕ АКТИВНА"
+        status.setTextColor(if (running) Color.rgb(0, 120, 70) else Color.rgb(170, 35, 35))
     }
 
     private fun match(height: Int) = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height)
-    companion object { private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT }
+    companion object { private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT; private const val VPN_REQUEST = 701 }
 }
